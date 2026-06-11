@@ -24,18 +24,26 @@ Plus the standard Eugene Plexus config trio (`GET /v1/config`,
 `GET /v1/config/schema`, `PATCH /v1/config`), `POST /v1/config/test`,
 `POST /v1/admin/restart`, and `GET /healthz`.
 
-## v0.3 skeleton status
+## Serving engine
 
-This repo currently ships the **control-plane skeleton**: the HTTP wire
-shape (routes + generated models + config + auth + health + safe mode) is
-complete, but the actual serving engine is **not implemented yet** and no
-model is loaded. The engine-dependent endpoints
-(`POST /v1/chat/completions`, `POST /v1/inference/endpoints`,
-`POST /v1/inference/endpoints/{endpointId}/load`) return `501 Not
-Implemented` with a standard `Problem` body explaining that the serving
-engine is future work. `GET /v1/models` returns the OpenAI-compatible
-empty list (`{object: list, data: []}`) and `GET /v1/inference/endpoints`
-returns an empty endpoint list.
+The serving engine is implemented. It loads a **self-describing checkpoint**
+(the trainer embeds the model's `ArchitectureConfig` and tokenizer into the
+checkpoint, so the inference host rebuilds and serves it standalone),
+renders chat messages through a ChatML-style template, and decodes with
+temperature / top-p / top-k sampling (greedy at `temperature=0`). Endpoints
+move through `unloaded → loading → ready`; a ready endpoint's `name` is the
+OpenAI `model` id clients pass.
+
+Make a checkpoint servable by placing it under the configured `modelsDir` as
+`<checkpointId>.pt` (or `<checkpointId>/latest.pt`), then create an endpoint
+and load it. The coordinator's serve stage automates this copy later.
+
+**v0.3 first-cut limits** (each a clean follow-up): CPU decode only (no GPU
+device selection yet); **no KV cache** — full-recompute decode, fine for the
+small local models this targets but `O(n²)` in generated length; single
+process; LoRA/adapter serving is rejected (`400`). A base (pretrained)
+checkpoint does text *continuation* — it only follows the chat template once
+it has been fine-tuned on one.
 
 ## Quick start
 
@@ -53,9 +61,11 @@ by hand.
 
 Per the project-wide rule (`feedback_degraded_mode_required.md`), a bad
 config never prevents the component from starting. Config endpoints stay
-reachable so operators can fix the broken setting through the UI;
-serving endpoints behave according to the skeleton (501) until the
-serving engine lands.
+reachable so operators can fix the broken setting through the UI. The
+engine builds without torch present (it's imported lazily on first
+load/chat), so the control plane always comes up; in **safe mode**
+(`EUGENE_PLEXUS_INF_SAFE_MODE=1`) serving is disabled and the
+serving/endpoint-mutating routes return `503` while config stays editable.
 
 ## Codegen
 
