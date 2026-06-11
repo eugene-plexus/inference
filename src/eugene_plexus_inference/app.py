@@ -20,13 +20,9 @@ from .settings import Settings, load_settings
 
 log = logging.getLogger(__name__)
 
-# The v0.3 skeleton ships no serving engine. `app.state.engine` stays None
-# and the serving/endpoint routes return 501; `engine_error` explains why
-# in /healthz details. When the engine lands the lifespan builds it here
-# and routes flip from 501 to real behavior.
-_SKELETON_ENGINE_ERROR = (
-    "serving engine not implemented in the v0.3 skeleton; no model loaded, "
-    "chat/completions and endpoint load return 501"
+_SAFE_MODE_ENGINE_ERROR = (
+    "safe mode active (EUGENE_PLEXUS_INF_SAFE_MODE=1): model serving is disabled; "
+    "config endpoints remain reachable. Fix config and restart without the env var."
 )
 
 
@@ -57,15 +53,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             master_key_b64=settings.master_key,
         )
 
-    # The serving engine is future work. We wire `app.state.engine`
-    # (None for now) and an explanatory `engine_error` so /healthz reports
-    # `degraded` and the serving routes have a uniform place to check.
-    # When the engine is implemented this is where it gets built — and a
-    # build failure here surfaces as degraded mode instead of crashing the
-    # process, per feedback_degraded_mode_required.md.
+    # Build the serving engine. Construction is torch-free (it only holds the
+    # endpoint registry and reads config); torch / tokenizers are imported
+    # lazily on the first load/chat, so the control plane boots even without
+    # them. In safe mode we leave the engine unbuilt so serving is disabled
+    # but config stays reachable; any unexpected build failure also degrades
+    # rather than crashing, per feedback_degraded_mode_required.md. Tests may
+    # pre-populate `app.state.engine`.
     if not hasattr(app.state, "engine"):
-        app.state.engine = None
-        app.state.engine_error = _SKELETON_ENGINE_ERROR
+        if settings.safe_mode:
+            app.state.engine = None
+            app.state.engine_error = _SAFE_MODE_ENGINE_ERROR
+        else:
+            try:
+                from .engine.engine import InferenceEngine
+
+                app.state.engine = InferenceEngine(config_store, device="cpu")
+                app.state.engine_error = None
+            except Exception as e:  # pragma: no cover - defensive degrade
+                log.exception("failed to build the inference engine; starting degraded")
+                app.state.engine = None
+                app.state.engine_error = f"engine initialization failed: {e}"
 
     yield
 
@@ -78,8 +86,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="Eugene Plexus — inference",
         description=(
             "Local model serving with OpenAI-compatible chat/completions "
-            "endpoints. v0.3 skeleton ships the control-plane wire shape; "
-            "the serving engine is future work."
+            "endpoints. Loads checkpoints produced by the trainer and serves "
+            "them; CPU decode with no KV cache in this first cut."
         ),
         version=__version__,
         lifespan=_lifespan,
